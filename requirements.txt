@@ -1,0 +1,10 @@
+# torch/torchvision are NOT installed from this file on Jetson: PyPI has no
+# CUDA-enabled wheel for Jetson's ARM64 + JetPack combination. Install
+# NVIDIA's JetPack-matched wheel first (see README.md "Install PyTorch for
+# Jetson"), THEN install everything below.
+opencv-python>=4.1.2
+numpy>=1.18.5
+Pillow
+PyYAML>=5.3
+yacs
+pyserial
