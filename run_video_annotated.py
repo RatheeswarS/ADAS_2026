@@ -92,16 +92,28 @@ from actuator.dbw_interface import ActuatorInterface, CommandMode            # n
 from actuator.dbw_backend import DbwBackend                                  # noqa: E402
 from safety.safety_monitor import SafetyMonitor                              # noqa: E402
 
-DEFAULT_WEIGHTS = os.path.join(HERE, "YOLOP", "weights", "End-to-end.pth")
+DEFAULT_ENGINE = os.path.join(HERE, "YOLOP", "weights", "yolop_ll_384x640.fp16.engine")
+DEFAULT_CHECKPOINT = os.path.join(HERE, "YOLOP", "weights", "End-to-end.pth")
 DEFAULT_SOURCE = os.path.join(HERE, "fintest.mp4")
+
+
+def default_weights(is_cuda: bool) -> str:
+    """Prefer the TensorRT engine (~3.5x faster, see README) when it exists AND
+    we ended up on a CUDA device; else the PyTorch checkpoint (the engine can't
+    run on CPU)."""
+    if is_cuda and os.path.exists(DEFAULT_ENGINE):
+        return DEFAULT_ENGINE
+    return DEFAULT_CHECKPOINT
 LIVE_WINDOW_NAME = "run_video_annotated -- live (q/ESC to stop)"
 
 # Per-source colours (BGR) for the warped-back lane boundary, keyed by how
 # that side's curve was obtained this frame (see lane_detection_node_birdeye).
 SOURCE_COLOURS = {
-    "direct":        (0, 255, 0),      # green   -- a real detection this frame
+    "direct":        (0, 255, 0),      # green   -- a full real detection this frame
+    "partial":       (0, 255, 255),    # yellow  -- short arc (e.g. outer line on a turn):
+                                       #            trusted for heading within its span only
     "reconstructed": (0, 215, 255),    # amber   -- inferred from the other side + width model
-    "held":          (0, 165, 255),    # orange  -- coasting on the last good fit
+    "held":          (0, 165, 255),    # orange  -- coasting on the last good fit (buffer)
     "none":          (120, 120, 120),  # grey    -- no curve
 }
 
@@ -362,7 +374,10 @@ def parse_args():
     ap.add_argument("--out-video", default=None, help="annotated video path (overrides --out-dir)")
     ap.add_argument("--out-csv", default=None, help="per-second CSV path (overrides --out-dir)")
     ap.add_argument("--frame-csv", default=None, help="optional extra per-frame CSV path")
-    ap.add_argument("--weights", default=DEFAULT_WEIGHTS, help="YOLOP checkpoint path")
+    ap.add_argument("--weights", default=None,
+                    help="YOLOP weights: a .engine (TensorRT) or .pth (checkpoint). "
+                         "Default: the bundled TensorRT engine when present and on GPU, "
+                         "else the .pth checkpoint.")
     ap.add_argument("--device", default="0",
                     help="'0' for CUDA:0, or 'cpu'. Auto-falls back to cpu if CUDA is "
                          "unavailable OR raises at load/inference (e.g. out-of-memory).")
@@ -479,9 +494,6 @@ def main():
     is_camera = str(opt.source).isdigit() or str(opt.source).startswith("/dev/")
     if not is_camera and not os.path.isfile(opt.source):
         raise SystemExit(f"Source not found (not a file, camera index, or /dev path): {opt.source}")
-    if not os.path.isfile(opt.weights):
-        raise SystemExit(f"YOLOP weights not found: {opt.weights}")
-
     # Live window needs a reachable display; on a headless box / SSH session
     # fall back to readings-only instead of crashing on cv2.imshow.
     if opt.show and not gui_available():
@@ -506,6 +518,14 @@ def main():
     except Exception as e:
         print(f"[warn] could not select device '{opt.device}' ({e}); falling back to cpu")
         device = select_device(None, "cpu")
+
+    # Resolve weights now that the real device is known (engine only on CUDA).
+    if opt.weights is None:
+        opt.weights = default_weights(device.type != "cpu")
+    if not os.path.isfile(opt.weights):
+        raise SystemExit(f"YOLOP weights not found: {opt.weights}")
+    kind = "TensorRT engine" if opt.weights.endswith(".engine") else "PyTorch checkpoint"
+    print(f"[info] YOLOP weights: {opt.weights} ({kind})")
 
     # ---- Arduino link (built before the node: it is also the speed source) ----
     # With --port it opens the real Arduino, which BOTH receives SDA commands

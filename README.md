@@ -93,6 +93,53 @@ sudo usermod -a -G dialout $USER
 
 Confirm the device exists and note its exact path: `ls -l /dev/ttyACM* /dev/ttyUSB* 2>/dev/null`.
 
+## Optional: TensorRT acceleration (Jetson)
+
+Eager PyTorch inference of YOLOP is the pipeline's dominant cost -- on a Jetson Orin the forward pass (plus pre/post-processing) measures ~113 ms/frame (~9 FPS) at `--img-size 640`, FP16. Converting the lane head to a TensorRT FP16 engine typically brings this to ~15-35 ms (a 3-6x speedup, ~25-40 FPS). This is optional -- the `.pth` path above works as-is -- but recommended before any real drive to cut sensorimotor latency.
+
+We only consume YOLOP's lane-line segmentation head, so we export a **lane-only wrapper** to ONNX. This deliberately skips the object-detection `Detect` layer's grid/anchor decoding (the part that makes full-YOLOP ONNX export painful) and the unused drivable-area head, producing a smaller graph and a faster engine. The bundled `export_yolop_onnx.py` is self-contained and does **not** need the ONNX/TensorRT export tooling that was stripped from the vendored `YOLOP/` copy.
+
+**Prerequisites:** TensorRT + `trtexec` (ships with JetPack, at `/usr/src/tensorrt/bin/trtexec`) and the `onnx` pip package. Build the engine **on the same Jetson it will run on** -- engines are device- and TensorRT-version-specific and are not portable between different Jetsons or JetPack/TRT versions.
+
+### 1. PyTorch -> ONNX (lane-only wrapper)
+
+```
+python export_yolop_onnx.py
+```
+
+Writes `YOLOP/weights/yolop_ll_384x640.onnx`. The static input shape `(1,3,384,640)` matches a **1280x720** camera through `letterbox_for_img(new_shape=640, auto=True)`. If your camera resolution differs, run one frame through `letterbox_for_img` and print `img.shape`, then set `H, W` at the top of `export_yolop_onnx.py` to match.
+
+### 2. ONNX -> TensorRT FP16 engine
+
+```
+/usr/src/tensorrt/bin/trtexec \
+  --onnx=YOLOP/weights/yolop_ll_384x640.onnx \
+  --saveEngine=YOLOP/weights/yolop_ll_384x640.fp16.engine \
+  --fp16 --useCudaGraph --noDataTransfers \
+  --iterations=100 --avgRuns=100
+```
+
+The first build takes ~1-5 min while TensorRT searches kernels (one-time). `trtexec` prints the mean GPU latency at the end -- that is your new per-frame inference number.
+
+### 3. Run with the engine (now the default)
+
+Once `YOLOP/weights/yolop_ll_384x640.fp16.engine` exists, **both entry points use it automatically on a CUDA device** -- no flag needed. The default weights resolver picks the engine when it's present and you're on GPU, and falls back to the `.pth` checkpoint otherwise (including any `--device cpu` run, since the engine can't run on CPU). Startup prints which one it chose, e.g. `[info] YOLOP weights: .../yolop_ll_384x640.fp16.engine (TensorRT engine)`.
+
+To force a specific one, pass `--weights` explicitly: any path ending in `.engine` selects TensorRT, anything else loads the checkpoint.
+
+```
+# uses the engine automatically:
+python run_video_to_arduino.py --device 0 --source /path/to/video.mp4 --port /dev/ttyACM0
+# force the PyTorch checkpoint instead:
+python run_video_to_arduino.py --device 0 --weights YOLOP/weights/End-to-end.pth ...
+```
+
+The pre/post-processing (letterbox, normalize, softmax, resize-to-full) is unchanged -- only the `model(x)` forward is replaced by an engine execution returning the raw `ll_seg` logits, so nothing downstream in the lane-fit/control path changes. `--img-size` is ignored for the geometry (the engine's input shape is baked in at export), so keep the camera resolution consistent with what you exported for.
+
+### 4. Verify numerics before trusting it
+
+TensorRT FP16 is not bit-identical to the PyTorch path. Run one real frame through both the `.pth` and the engine and confirm the lane-probability maps agree within FP16 tolerance (max abs diff around 1e-2) before relying on the engine on a moving vehicle.
+
 ## Running it
 
 ```
@@ -113,7 +160,7 @@ python run_video_to_arduino.py \
 | `--source` | *(required)* | Path to the input video file. |
 | `--port` | *(required)* | Arduino serial device path, e.g. `/dev/ttyACM0`. |
 | `--baud` | `115200` | Serial baud rate. |
-| `--weights` | `YOLOP/weights/End-to-end.pth` | YOLOP checkpoint path (bundled, no need to change). |
+| `--weights` | *(auto)* | YOLOP weights: a `.engine` (TensorRT) or `.pth` (checkpoint). Defaults to the bundled TensorRT engine when it exists and you're on GPU, else the `.pth` checkpoint. See "TensorRT acceleration". |
 | `--device` | `0` | `0` selects CUDA:0 (the Jetson's GPU) -- pass `cpu` to force CPU inference (much slower, but useful for a sanity-check run without a GPU). |
 | `--img-size` | `640` | YOLOP inference resolution. |
 | `--lane-width` | `3.0` | Assumed lane width in meters. A hand-picked starting value carried over from `baja_lka`, not a measurement of your actual track/course -- tune to match reality. |

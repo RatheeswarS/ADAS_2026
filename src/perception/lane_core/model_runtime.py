@@ -32,7 +32,63 @@ to_tensor = transforms.Compose([
 ])
 
 
+class TRTLaneModel:
+    """Runs the lane-only TensorRT engine produced by export_yolop_onnx.py +
+    trtexec. Exposes the same (1,2,H,W) ll_seg logits that the PyTorch model's
+    third head returns, so run_inference()'s pre/post-processing is unchanged.
+
+    Engine I/O is FP32 by default (trtexec --fp16 keeps network I/O in fp32 and
+    reformats internally), so this consumes an fp32 input and yields an fp32
+    output regardless of the checkpoint's `half` flag."""
+    is_trt = True
+
+    def __init__(self, engine_path: str, device):
+        import tensorrt as trt  # imported lazily so the pure-PyTorch path never needs TRT
+        self.trt = trt
+        self.device = device
+        logger = trt.Logger(trt.Logger.WARNING)
+        with open(engine_path, "rb") as f, trt.Runtime(logger) as runtime:
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+        if self.engine is None:
+            raise RuntimeError(f"failed to deserialize TensorRT engine: {engine_path}")
+        self.context = self.engine.create_execution_context()
+        # Resolve the single input / single output tensor names by I/O mode.
+        self.in_name = self.out_name = None
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                self.in_name = name
+            else:
+                self.out_name = name
+        self.in_shape = tuple(self.engine.get_tensor_shape(self.in_name))
+        self.out_shape = tuple(self.engine.get_tensor_shape(self.out_name))
+
+    def warmup(self):
+        """Run one inference on a correctly-shaped zero tensor so the first real
+        frame doesn't pay lazy-init cost. Uses the engine's own input shape --
+        the node's square warmup frame would letterbox to the wrong size."""
+        self.infer(torch.zeros(self.in_shape, dtype=torch.float32, device=self.device))
+
+    def infer(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (1,3,H,W) fp32 CUDA tensor -> (1,2,H,W) fp32 CUDA tensor."""
+        x = x.contiguous()
+        out = torch.empty(self.out_shape, dtype=torch.float32, device=self.device)
+        self.context.set_input_shape(self.in_name, tuple(x.shape))
+        self.context.set_tensor_address(self.in_name, x.data_ptr())
+        self.context.set_tensor_address(self.out_name, out.data_ptr())
+        stream = torch.cuda.current_stream(self.device)
+        self.context.execute_async_v3(stream.cuda_stream)
+        stream.synchronize()
+        return out
+
+
 def load_model(weights_path: str, device):
+    # A .engine path selects the TensorRT runtime (see README "TensorRT
+    # acceleration"); anything else is the PyTorch checkpoint.
+    if weights_path.endswith(".engine"):
+        if device.type == "cpu":
+            raise ValueError("TensorRT engine requires a CUDA device, got cpu")
+        return TRTLaneModel(weights_path, device)
     model = get_net(cfg)
     checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["state_dict"])
@@ -48,10 +104,14 @@ def run_inference(model, frame_bgr, img_size: int, device, half: bool):
     img = np.ascontiguousarray(img)
 
     x = to_tensor(img).unsqueeze(0).to(device)
-    x = x.half() if half else x.float()
 
-    with torch.no_grad():
-        _, _, ll_seg_out = model(x)
+    if getattr(model, "is_trt", False):
+        # Engine I/O is fp32; `half` does not apply to the TRT path.
+        ll_seg_out = model.infer(x.float())
+    else:
+        x = x.half() if half else x.float()
+        with torch.no_grad():
+            _, _, ll_seg_out = model(x)
 
     _, _, hp, wp = x.shape
     pad_w, pad_h = int(pad_w), int(pad_h)

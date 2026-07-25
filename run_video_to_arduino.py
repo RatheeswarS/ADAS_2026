@@ -53,13 +53,26 @@ from actuator.dbw_interface import ActuatorInterface, CommandMode  # noqa: E402
 from actuator.sda_serial_backend import SdaSerialBackend  # noqa: E402
 from safety.safety_monitor import SafetyMonitor  # noqa: E402
 
-DEFAULT_WEIGHTS = os.path.join(HERE, "YOLOP", "weights", "End-to-end.pth")
+DEFAULT_ENGINE = os.path.join(HERE, "YOLOP", "weights", "yolop_ll_384x640.fp16.engine")
+DEFAULT_CHECKPOINT = os.path.join(HERE, "YOLOP", "weights", "End-to-end.pth")
+
+
+def default_weights(device: str) -> str:
+    """Prefer the TensorRT engine (~3.5x faster, see README) when it exists AND
+    we're on a CUDA device; otherwise fall back to the PyTorch checkpoint. The
+    engine can't run on CPU, so a `--device cpu` run always uses the checkpoint."""
+    if device != "cpu" and os.path.exists(DEFAULT_ENGINE):
+        return DEFAULT_ENGINE
+    return DEFAULT_CHECKPOINT
 
 
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--source", required=True, help="input video file path (a recorded file, not a camera index)")
-    ap.add_argument("--weights", default=DEFAULT_WEIGHTS, help="YOLOP checkpoint path")
+    ap.add_argument("--weights", default=None,
+                    help="YOLOP weights: a .engine (TensorRT) or .pth (checkpoint). "
+                         "Default: the bundled TensorRT engine when present and on GPU, "
+                         "else the .pth checkpoint.")
     ap.add_argument("--device", default="0", help="'0' for CUDA:0 (Jetson GPU), or 'cpu'")
     ap.add_argument("--img-size", type=int, default=640, help="YOLOP inference resolution")
     ap.add_argument("--lane-width", type=float, default=3.0, help="assumed lane width in meters")
@@ -91,6 +104,11 @@ def main():
     opt = parse_args()
 
     device = select_device(None, opt.device)
+
+    if opt.weights is None:
+        opt.weights = default_weights(opt.device)
+    kind = "TensorRT engine" if opt.weights.endswith(".engine") else "PyTorch checkpoint"
+    print(f"[info] YOLOP weights: {opt.weights} ({kind})")
 
     # Arduino link first: it owns the serial port AND reads the motor
     # controller's speed telemetry off it -- so the ego-state's speed source
